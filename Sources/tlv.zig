@@ -13,6 +13,8 @@ pub const EncodingType = union(enum) {
     uleb128
 };
 
+pub const uleb128 = @import("uleb128.zig");
+
 pub fn Tlv(comptime TagType: type, comptime encodingType: EncodingType) type {
     return struct {
 
@@ -38,7 +40,7 @@ pub fn Tlv(comptime TagType: type, comptime encodingType: EncodingType) type {
             length: HeaderInt,
             value: []const u8,
 
-            // TODO: Static and dynamic modes
+            /// TODO: Static and dynamic modes
             pub fn deinit(self: *const Message, allocator: std.mem.Allocator) void {
                 // first expand the value to use its entire capacity before
                 // attempting to deallocate it
@@ -68,7 +70,7 @@ pub fn Tlv(comptime TagType: type, comptime encodingType: EncodingType) type {
             var write_buffer = buffer;
             var write_len: usize = 0;
 
-            while (write_buffer.len != 0 and buffer.len != 0) {
+            while (write_buffer.len != 0) {
                 const len = try reader.read(write_buffer);
                 if (len == 0) break;
                 write_buffer = write_buffer[len..];
@@ -85,17 +87,7 @@ pub fn Tlv(comptime TagType: type, comptime encodingType: EncodingType) type {
             return switch (encoding) {
                 .fixed_little => try reader.readInt(HeaderInt, .little),
                 .fixed_big => try reader.readInt(HeaderInt, .big),
-                .uleb128 => {
-                    var result: HeaderInt = 0;
-                    var shift: HeaderInt = 0;
-
-                    while (true) : (shift += 7) {
-                        if (shift >= @bitSizeOf(HeaderInt)) return error.LengthOverflow;
-                        const byte: HeaderInt = @intCast(try reader.readByte());
-                        result |= (byte & 0x7F) << @intCast(shift);
-                        if (byte & 0x80 == 0) return result;
-                    }
-                }
+                .uleb128 => try uleb128.read(HeaderInt, reader)
             };
         }
 
@@ -126,18 +118,7 @@ pub fn Tlv(comptime TagType: type, comptime encodingType: EncodingType) type {
                     const value: u8 = @truncate((integer >> @intCast(shift)) & 0xFF);
                     try writer.writeByte(value);
                 },
-                .uleb128 => {
-                    if (integer == 0)
-                        return try writer.writeByte(0);
-                    var value = integer;
-
-                    while (value != 0) {
-                        var emitting_byte: u8 = @truncate(value & 0x7F);
-                        value >>= 7;
-                        if (value != 0) emitting_byte |= 0x80;
-                        try writer.writeByte(emitting_byte);
-                    }
-                }
+                .uleb128 => try uleb128.write(T, integer, writer)
             }
         }
     };
@@ -146,7 +127,7 @@ pub fn Tlv(comptime TagType: type, comptime encodingType: EncodingType) type {
 // Tests
 
 const TestTag32 = enum(u32) {
-    one,
+    one = 0,
     two,
     three,
     _
@@ -213,7 +194,7 @@ test "read subsequent" {
 }
 
 const TestTag16 = enum(u16) {
-    one,
+    one = 0,
     two,
     three,
     _
@@ -236,15 +217,14 @@ test "read zero" {
     try std.testing.expectEqualSlices(u8, &.{}, message.value);
     try std.testing.expect(message.is_complete());
 
-    // TODO: Zero length misreads second message
-    // const other_message = try TlvInstance.read(std.testing.allocator, test_buffer.reader());
-    // defer other_message.deinit(std.testing.allocator);
+    const other_message = try TlvInstance.read(std.testing.allocator, test_buffer.reader());
+    defer other_message.deinit(std.testing.allocator);
 
-    // try std.testing.expectEqual(TestTag16.three, message.tag);
-    // try std.testing.expectEqual(@as(u32, 4), message.length);
-    // try std.testing.expectEqual(@as(usize, 4), message.value.len);
-    // try std.testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, message.value);
-    // try std.testing.expect(message.is_complete());
+    try std.testing.expectEqual(TestTag16.three, other_message.tag);
+    try std.testing.expectEqual(@as(u32, 4), other_message.length);
+    try std.testing.expectEqual(@as(usize, 4), other_message.value.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, other_message.value);
+    try std.testing.expect(other_message.is_complete());
 }
 
 test "read incomplete" {
@@ -261,6 +241,14 @@ test "read incomplete" {
     try std.testing.expectEqual(@as(usize, 4), message.value.len);
     try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x03, 0x04 }, message.value);
     try std.testing.expect(!message.is_complete());
+}
+
+test "read end of stream" {
+    var test_buffer = std.io.fixedBufferStream(&[_]u8 {
+        0x01, 0x00,
+        0x08 });
+    const TlvInstance = Tlv(TestTag16, .{ .fixed_little = u16 });
+    try std.testing.expectError(error.EndOfStream, TlvInstance.read(std.testing.allocator, test_buffer.reader()));
 }
 
 test "write" {
@@ -337,17 +325,6 @@ test "read uleb128" {
     try std.testing.expect(message.is_complete());
 }
 
-test "read uleb128 overflow" {
-    var test_buffer = std.io.fixedBufferStream(&[_]u8 {
-        0x80, 0x80, 0x80, 0x80,
-        0x80, 0x80, 0x80, 0x80,
-        0x80, 0x80, 0x80, 0x80,
-        0x00 });
-    const TlvInstance = Tlv(TestTag64, .uleb128);
-
-    try std.testing.expectError(error.LengthOverflow, TlvInstance.read(std.testing.allocator, test_buffer.reader()));
-}
-
 test "write uleb128" {
     var output = std.ArrayList(u8).init(std.testing.allocator);
     defer output.deinit();
@@ -384,4 +361,55 @@ test "read/write uleb128 roundtrip" {
     try std.testing.expectEqual(@as(u32, 12), message.length);
     try std.testing.expectEqualSlices(u8, "Hello world!", message.value);
     try std.testing.expect(message.is_complete());
+}
+
+test "read/write uleb128 zero" {
+    const Tag = enum(usize) { _ };
+
+    const TlvInstance = Tlv(Tag, .uleb128);
+
+    var outgoing = std.ArrayList(u8).init(std.testing.allocator);
+    defer outgoing.deinit();
+    try TlvInstance.write(@enumFromInt(0), "", outgoing.writer());
+
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00 }, outgoing.items);
+
+    var incoming = std.io.fixedBufferStream(outgoing.items);
+    const message = try TlvInstance.read(std.testing.allocator, incoming.reader());
+    defer message.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(Tag, @enumFromInt(0)), message.tag);
+    try std.testing.expectEqual(@as(u32, 0), message.length);
+    try std.testing.expectEqualSlices(u8, "", message.value);
+    try std.testing.expect(message.is_complete());
+}
+
+test "read/write uleb128 zero 2" {
+    const Tag = enum(usize) { _ };
+
+    const TlvInstance = Tlv(Tag, .uleb128);
+
+    var outgoing = std.ArrayList(u8).init(std.testing.allocator);
+    defer outgoing.deinit();
+    try TlvInstance.write(@enumFromInt(0), "", outgoing.writer());
+    try TlvInstance.write(@enumFromInt(1), "", outgoing.writer());
+
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x01, 0x00 }, outgoing.items);
+
+    var incoming = std.io.fixedBufferStream(outgoing.items);
+    const message = try TlvInstance.read(std.testing.allocator, incoming.reader());
+    defer message.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(Tag, @enumFromInt(0)), message.tag);
+    try std.testing.expectEqual(@as(u32, 0), message.length);
+    try std.testing.expectEqualSlices(u8, "", message.value);
+    try std.testing.expect(message.is_complete());
+
+    const other_message = try TlvInstance.read(std.testing.allocator, incoming.reader());
+    defer other_message.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(Tag, @enumFromInt(1)), other_message.tag);
+    try std.testing.expectEqual(@as(u32, 0), other_message.length);
+    try std.testing.expectEqualSlices(u8, "", other_message.value);
+    try std.testing.expect(other_message.is_complete());
 }

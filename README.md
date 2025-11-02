@@ -82,7 +82,7 @@ try std.testing.expect(message.is_complete());
 
 ```zig
 const tlv = b.dependency("tlv", .{ ... });
-exec.root_module.addImport("tlv", tinytokeniser.module("tlv"));
+exec.root_module.addImport("tlv", tlv.module("tlv"));
 // ...
 ```
 
