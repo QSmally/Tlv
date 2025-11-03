@@ -3,14 +3,26 @@ const std = @import("std");
 
 /// Tag/length encoding type, either a fixed amount of bytes or a special
 /// encoding.
-/// TODO: vlq type
 pub const EncodingType = union(enum) {
-    /// bytes
+    /// Fixed-width bytes
     fixed_little: type,
-    /// bytes
+    /// Fixed-width bytes
     fixed_big: type,
     /// ULEB128 (Little Endian Base 128) is variable-length
     uleb128
+};
+
+pub const ReadOptions = struct {
+    /// Return error.InvalidTag if the TLV message tag doesn't
+    /// correspond to a tag in the backing enum.
+    exhaustive_tags: bool = false,
+    /// Parse and discard the rest of the message if error.InvalidTag
+    /// occurs. This means that invalid tags are interpreted as version
+    /// mismatches instead of malformed bytes.
+    discard: bool = false,
+    /// Return error.PayloadTooLarge if the TLV message has a length
+    /// greater than this value. Always discards the payload.
+    max_size: usize = 4096
 };
 
 pub const uleb128 = @import("uleb128.zig");
@@ -30,6 +42,12 @@ pub fn Tlv(comptime TagType: type, comptime encodingType: EncodingType) type {
                 @compileError("Encoding type must have an underlying integer type, not " ++ @typeName(HeaderInt));
             if (@typeInfo(@typeInfo(Tag).@"enum".tag_type).int.bits < @typeInfo(HeaderInt).int.bits)
                 @compileError("Underlying encoding integer has a larger bitwidth than tag type " ++ @typeName(Tag));
+
+            // reader.skipBytes() takes a max 64 bits length
+            if (@typeInfo(HeaderInt).int.bits > 64)
+                @compileError(std.fmt.comptimePrint("Underlying encoding integer must not be greater than 64 bits (< {})", .{ @typeInfo(HeaderInt).int.bits }));
+
+            // lacking uleb128 support
             if (@typeInfo(HeaderInt).int.signedness != .unsigned)
                 @compileError("Underlying encoding integer may not be signed");
         }
@@ -40,7 +58,6 @@ pub fn Tlv(comptime TagType: type, comptime encodingType: EncodingType) type {
             length: HeaderInt,
             value: []const u8,
 
-            /// TODO: Static and dynamic modes
             pub fn deinit(self: *const Message, allocator: std.mem.Allocator) void {
                 // first expand the value to use its entire capacity before
                 // attempting to deallocate it
@@ -61,9 +78,23 @@ pub fn Tlv(comptime TagType: type, comptime encodingType: EncodingType) type {
         pub const Tag = TagType;
         pub const encoding = encodingType;
 
+        /// Max size is 4096 and exhaustive tags are disabled by default; use
+        /// `read_options` to change it.
         pub fn read(allocator: std.mem.Allocator, reader: anytype) !Message {
+            return read_options(allocator, reader, .{});
+        }
+
+        pub fn read_options(allocator: std.mem.Allocator, reader: anytype, options: ReadOptions) !Message {
             const tag = try read_head(reader);
+            const is_invalid = std.enums.tagName(Tag, @enumFromInt(tag)) == null;
+            if (is_invalid and options.exhaustive_tags and !options.discard) return error.InvalidTag;
+
             const length = try read_head(reader);
+
+            if (is_invalid and options.exhaustive_tags)
+                return try skip_and_error(error.InvalidTag, length, reader);
+            if (length > options.max_size)
+                return try skip_and_error(error.PayloadTooLarge, length, reader);
 
             var buffer = try allocator.alloc(u8, length);
             errdefer allocator.free(buffer);
@@ -89,6 +120,16 @@ pub fn Tlv(comptime TagType: type, comptime encodingType: EncodingType) type {
                 .fixed_big => try reader.readInt(HeaderInt, .big),
                 .uleb128 => try uleb128.read(HeaderInt, reader)
             };
+        }
+
+        fn skip_and_error(comptime ret: anyerror, length: usize, reader: anytype) !noreturn {
+            reader.skipBytes(length, .{}) catch |err| switch (err) {
+                // normally no EndOfStream is given after the header was
+                // parsed, only an incomplete buffer, so it makes sense to
+                // discard the error and return PayloadTooLarge.
+                error.EndOfStream => return ret
+            };
+            return ret;
         }
 
         pub fn write(tag: Tag, value: []const u8, inner_writer: anytype) !void {
@@ -249,6 +290,84 @@ test "read end of stream" {
         0x08 });
     const TlvInstance = Tlv(TestTag16, .{ .fixed_little = u16 });
     try std.testing.expectError(error.EndOfStream, TlvInstance.read(std.testing.allocator, test_buffer.reader()));
+}
+
+test "read exhaustive_tags" {
+    var test_buffer = std.io.fixedBufferStream(&[_]u8 {
+        0x01, 0x00,
+        0x04, 0x00,
+        0xDE, 0xAD, 0xBE, 0xEF,
+        0xEA, 0x00,
+        0x01, 0x00,
+        0x04, 0x00,
+        0xDE, 0xAD, 0xBE, 0xEF });
+    const TlvInstance = Tlv(TestTag16, .{ .fixed_little = u16 });
+    const options = ReadOptions { .exhaustive_tags = true };
+    const message = try TlvInstance.read_options(std.testing.allocator, test_buffer.reader(), options);
+    defer message.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(TestTag16.two, message.tag);
+    try std.testing.expectEqual(@as(u32, 4), message.length);
+    try std.testing.expectEqual(@as(usize, 4), message.value.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, message.value);
+    try std.testing.expect(message.is_complete());
+
+    try std.testing.expectError(error.InvalidTag, TlvInstance.read_options(std.testing.allocator, test_buffer.reader(), options));
+
+    const other_message = try TlvInstance.read_options(std.testing.allocator, test_buffer.reader(), options);
+    defer other_message.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(TestTag16.two, other_message.tag);
+}
+
+test "read exhaustive_tags + discard" {
+    var test_buffer = std.io.fixedBufferStream(&[_]u8 {
+        0x01, 0x00,
+        0x04, 0x00,
+        0xDE, 0xAD, 0xBE, 0xEF,
+        0xEA, 0x00,
+        0x04, 0x00,
+        0xDE, 0xAD, 0xBE, 0xEF,
+        0x02, 0x00,
+        0x00, 0x00 });
+    const TlvInstance = Tlv(TestTag16, .{ .fixed_little = u16 });
+    const options = ReadOptions { .exhaustive_tags = true, .discard = true };
+    const message = try TlvInstance.read_options(std.testing.allocator, test_buffer.reader(), options);
+    defer message.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(TestTag16.two, message.tag);
+    try std.testing.expectEqual(@as(u32, 4), message.length);
+    try std.testing.expectEqual(@as(usize, 4), message.value.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, message.value);
+    try std.testing.expect(message.is_complete());
+
+    try std.testing.expectError(error.InvalidTag, TlvInstance.read_options(std.testing.allocator, test_buffer.reader(), options));
+
+    const other_message = try TlvInstance.read_options(std.testing.allocator, test_buffer.reader(), options);
+    defer other_message.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(TestTag16.three, other_message.tag);
+}
+
+test "read max_size" {
+    var test_buffer = std.io.fixedBufferStream(&[_]u8 {
+        0x01, 0x00,
+        0x08, 0x00,
+        0xEA, 0xEA, 0xEA, 0xEA, 0xEA, 0xEA, 0xEA, 0xEA,
+        0x02, 0x00,
+        0x04, 0x00,
+        0xDE, 0xAD, 0xBE, 0xEF });
+    const TlvInstance = Tlv(TestTag16, .{ .fixed_little = u16 });
+    try std.testing.expectError(error.PayloadTooLarge, TlvInstance.read_options(std.testing.allocator, test_buffer.reader(), .{ .max_size = 4 }));
+
+    const message = try TlvInstance.read_options(std.testing.allocator, test_buffer.reader(), .{ .max_size = 4 });
+    defer message.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(TestTag16.three, message.tag);
+    try std.testing.expectEqual(@as(u32, 4), message.length);
+    try std.testing.expectEqual(@as(usize, 4), message.value.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, message.value);
+    try std.testing.expect(message.is_complete());
 }
 
 test "write" {

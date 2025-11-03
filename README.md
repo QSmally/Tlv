@@ -6,10 +6,10 @@ Tag-length-value protocol implementation
 ## Description
 
 Tlv is a simple and configurable coding protocol. It can be used to frame bytes to robustly
-communicate them as messages over a network, for example. Tlv guarantees that received messages are
-not cut off in the middle of receiving due to read batch artifacts.
+communicate them as messages over a network. Tlv guarantees that messages would not unknowingly be
+cut off in the middle of receiving due to read batch artifacts.
 
-Zig Tlv uses the standard reader/writer interfaces, so it's compatible with e.g. sockets.
+Zig Tlv uses the standard reader/writer interfaces, so it's compatible with e.g. socket streams.
 
 **Example using a fixed-width tag-length header of 32 bits each**:
 
