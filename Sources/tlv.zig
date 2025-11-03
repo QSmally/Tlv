@@ -127,7 +127,10 @@ pub fn Tlv(comptime TagType: type, comptime encodingType: EncodingType) type {
                 // normally no EndOfStream is given after the header was
                 // parsed, only an incomplete buffer, so it makes sense to
                 // discard the error and return PayloadTooLarge.
-                error.EndOfStream => return ret
+                error.EndOfStream => return ret,
+
+                // different per reader
+                else => |the_err| return the_err
             };
             return ret;
         }
